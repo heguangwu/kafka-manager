@@ -6,26 +6,31 @@
 package kafka.manager
 
 import java.util.Properties
-import java.util.concurrent.{LinkedBlockingQueue, TimeUnit, ThreadPoolExecutor}
+import java.util.concurrent.{LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
 import akka.actor.{ActorPath, ActorSystem, Props}
 import akka.util.Timeout
-import com.typesafe.config.{ConfigFactory, Config}
+import com.typesafe.config.{Config, ConfigFactory}
 import grizzled.slf4j.Logging
-import kafka.manager.actor.{KafkaManagerActorConfig, KafkaManagerActor}
-import kafka.manager.model.{ClusterConfig, ClusterContext, CuratorConfig, ActorModel}
+import kafka.manager.actor.{KafkaManagerActor, KafkaManagerActorConfig}
+import kafka.manager.base.LongRunningPoolConfig
+import kafka.manager.model._
 import ActorModel._
+import kafka.manager.actor.cluster.KafkaManagedOffsetCacheConfig
+import kafka.manager.utils.UtilException
+import kafka.manager.utils.zero81.ReassignPartitionErrors.ReplicationOutOfSync
+import kafka.manager.utils.zero81.{ForceOnReplicationOutOfSync, ForceReassignmentCommand, ReassignPartitionErrors}
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.reflect.ClassTag
-import scala.util.{Success, Failure, Try}
+import scala.util.{Failure, Success, Try}
 
 /**
  * @author hiral
  */
 case class TopicListExtended(list: IndexedSeq[(String, Option[TopicIdentity])],
-                             topicToConsumerMap: Map[String, Iterable[String]],
+                             topicToConsumerMap: Map[String, Iterable[(String, ConsumerType)]],
                              deleteSet: Set[String],
                              underReassignments: IndexedSeq[String],
                              clusterContext: ClusterContext)
@@ -33,10 +38,10 @@ case class BrokerListExtended(list: IndexedSeq[BrokerIdentity],
                               metrics: Map[Int,BrokerMetrics],
                               combinedMetric: Option[BrokerMetrics],
                               clusterContext: ClusterContext)
-case class ConsumerListExtended(list: IndexedSeq[(String, Option[ConsumerIdentity])], clusterContext: ClusterContext)
+case class ConsumerListExtended(list: IndexedSeq[((String, ConsumerType), Option[ConsumerIdentity])], clusterContext: ClusterContext)
 case class LogkafkaListExtended(list: IndexedSeq[(String, Option[LogkafkaIdentity])], deleteSet: Set[String])
 
-case class ApiError(msg: String)
+case class ApiError(msg: String, recoverByForceOperation: Boolean = false)
 object ApiError extends Logging {
 
   implicit def fromThrowable(t: Throwable) : ApiError = {
@@ -54,6 +59,7 @@ object ApiError extends Logging {
 
 object KafkaManager {
 
+  val ConsumerPropertiesFile = "kafka-manager.consumer.properties.file"
   val BaseZkPath = "kafka-manager.base-zk-path"
   val PinnedDispatchName = "kafka-manager.pinned-dispatcher-name"
   val ZkHosts = "kafka-manager.zkhosts"
@@ -71,6 +77,13 @@ object KafkaManager {
   val SimpleConsumerSocketTimeoutMillis = "kafka-manager.simple-consumer-socket-timeout-millis"
   val BrokerViewThreadPoolSize = "kafka-manager.broker-view-thread-pool-size"
   val BrokerViewMaxQueueSize = "kafka-manager.broker-view-max-queue-size"
+  val OffsetCacheThreadPoolSize = "kafka-manager.offset-cache-thread-pool-size"
+  val OffsetCacheMaxQueueSize = "kafka-manager.offset-cache-max-queue-size"
+  val KafkaAdminClientThreadPoolSize = "kafka-manager.kafka-admin-client-thread-pool-size"
+  val KafkaAdminClientMaxQueueSize = "kafka-manager.kafka-admin-client-max-queue-size"
+  val KafkaManagedOffsetMetadataCheckMillis = "kafka-manager.kafka-managed-offset-metadata-check-millis"
+  val KafkaManagedOffsetGroupCacheSize = "kafka-manager.kafka-managed-offset-group-cache-size"
+  val KafkaManagedOffsetGroupExpireDays = "kafka-manager.kafka-managed-offset-group-expire-days"
 
   val DefaultConfig: Config = {
     val defaults: Map[String, _ <: AnyRef] = Map(
@@ -89,7 +102,14 @@ object KafkaManager {
       PartitionOffsetCacheTimeoutSecs -> "5",
       SimpleConsumerSocketTimeoutMillis -> "10000",
       BrokerViewThreadPoolSize -> Runtime.getRuntime.availableProcessors().toString,
-      BrokerViewMaxQueueSize -> "1000"
+      BrokerViewMaxQueueSize -> "1000",
+      OffsetCacheThreadPoolSize -> Runtime.getRuntime.availableProcessors().toString,
+      OffsetCacheMaxQueueSize -> "1000",
+      KafkaAdminClientThreadPoolSize -> Runtime.getRuntime.availableProcessors().toString,
+      KafkaAdminClientMaxQueueSize -> "1000",
+      KafkaManagedOffsetMetadataCheckMillis -> KafkaManagedOffsetCacheConfig.defaultGroupMemberMetadataCheckMillis.toString,
+      KafkaManagedOffsetGroupCacheSize -> KafkaManagedOffsetCacheConfig.defaultGroupTopicPartitionOffsetMaxSize.toString,
+      KafkaManagedOffsetGroupExpireDays -> KafkaManagedOffsetCacheConfig.defaultGroupTopicPartitionOffsetExpireDays.toString
     )
     import scala.collection.JavaConverters._
     ConfigFactory.parseMap(defaults.asJava)
@@ -99,30 +119,47 @@ object KafkaManager {
 import KafkaManager._
 import akka.pattern._
 import scalaz.{-\/, \/, \/-}
-class KafkaManager(akkaConfig: Config)
-{
+class KafkaManager(akkaConfig: Config) extends Logging {
   private[this] val system = ActorSystem("kafka-manager-system", akkaConfig)
 
   private[this] val configWithDefaults = akkaConfig.withFallback(DefaultConfig)
+  val defaultTuning = ClusterTuning(
+    brokerViewUpdatePeriodSeconds = Option(configWithDefaults.getInt(BrokerViewUpdateSeconds))
+    , clusterManagerThreadPoolSize = Option(configWithDefaults.getInt(ThreadPoolSize))
+    , clusterManagerThreadPoolQueueSize = Option(configWithDefaults.getInt(MaxQueueSize))
+    , kafkaCommandThreadPoolSize = Option(configWithDefaults.getInt(ThreadPoolSize))
+    , kafkaCommandThreadPoolQueueSize = Option(configWithDefaults.getInt(MaxQueueSize))
+    , logkafkaCommandThreadPoolSize = Option(configWithDefaults.getInt(ThreadPoolSize))
+    , logkafkaCommandThreadPoolQueueSize = Option(configWithDefaults.getInt(MaxQueueSize))
+    , logkafkaUpdatePeriodSeconds = Option(configWithDefaults.getInt(BrokerViewUpdateSeconds))
+    , partitionOffsetCacheTimeoutSecs = Option(configWithDefaults.getInt(PartitionOffsetCacheTimeoutSecs))
+    , brokerViewThreadPoolSize = Option(configWithDefaults.getInt(BrokerViewThreadPoolSize))
+    , brokerViewThreadPoolQueueSize = Option(configWithDefaults.getInt(BrokerViewMaxQueueSize))
+    , offsetCacheThreadPoolSize = Option(configWithDefaults.getInt(OffsetCacheThreadPoolSize))
+    , offsetCacheThreadPoolQueueSize = Option(configWithDefaults.getInt(OffsetCacheMaxQueueSize))
+    , kafkaAdminClientThreadPoolSize = Option(configWithDefaults.getInt(KafkaAdminClientThreadPoolSize))
+    , kafkaAdminClientThreadPoolQueueSize = Option(configWithDefaults.getInt(KafkaAdminClientMaxQueueSize))
+    , kafkaManagedOffsetMetadataCheckMillis = Option(configWithDefaults.getInt(KafkaManagedOffsetMetadataCheckMillis))
+    , kafkaManagedOffsetGroupCacheSize = Option(configWithDefaults.getInt(KafkaManagedOffsetGroupCacheSize))
+    , kafkaManagedOffsetGroupExpireDays = Option(configWithDefaults.getInt(KafkaManagedOffsetGroupExpireDays))
+  )
   private[this] val kafkaManagerConfig = {
     val curatorConfig = CuratorConfig(configWithDefaults.getString(ZkHosts))
     KafkaManagerActorConfig(
-      curatorConfig = curatorConfig,
-      baseZkPath = configWithDefaults.getString(BaseZkPath),
-      pinnedDispatcherName = configWithDefaults.getString(PinnedDispatchName),
-      brokerViewUpdatePeriod = FiniteDuration(configWithDefaults.getInt(BrokerViewUpdateSeconds), SECONDS),
-      startDelayMillis = configWithDefaults.getLong(StartDelayMillis),
-      threadPoolSize = configWithDefaults.getInt(ThreadPoolSize),
-      mutexTimeoutMillis = configWithDefaults.getInt(MutexTimeoutMillis),
-      maxQueueSize = configWithDefaults.getInt(MaxQueueSize),
-      kafkaManagerUpdatePeriod = FiniteDuration(configWithDefaults.getInt(KafkaManagerUpdateSeconds), SECONDS),
-      deleteClusterUpdatePeriod = FiniteDuration(configWithDefaults.getInt(DeleteClusterUpdateSeconds), SECONDS),
-      deletionBatchSize = configWithDefaults.getInt(DeletionBatchSize),
-      clusterActorsAskTimeoutMillis = configWithDefaults.getInt(ClusterActorsAskTimeoutMillis),
-      partitionOffsetCacheTimeoutSecs = configWithDefaults.getInt(PartitionOffsetCacheTimeoutSecs),
-      simpleConsumerSocketTimeoutMillis =  configWithDefaults.getInt(SimpleConsumerSocketTimeoutMillis),
-      brokerViewThreadPoolSize = configWithDefaults.getInt(BrokerViewThreadPoolSize),
-      brokerViewMaxQueueSize = configWithDefaults.getInt(BrokerViewMaxQueueSize)
+      curatorConfig = curatorConfig
+      , baseZkPath = configWithDefaults.getString(BaseZkPath)
+      , pinnedDispatcherName = configWithDefaults.getString(PinnedDispatchName)
+      , startDelayMillis = configWithDefaults.getLong(StartDelayMillis)
+      , threadPoolSize = configWithDefaults.getInt(ThreadPoolSize)
+      , mutexTimeoutMillis = configWithDefaults.getInt(MutexTimeoutMillis)
+      , maxQueueSize = configWithDefaults.getInt(MaxQueueSize)
+      , kafkaManagerUpdatePeriod = FiniteDuration(configWithDefaults.getInt(KafkaManagerUpdateSeconds), SECONDS)
+      , deleteClusterUpdatePeriod = FiniteDuration(configWithDefaults.getInt(DeleteClusterUpdateSeconds), SECONDS)
+      , deletionBatchSize = configWithDefaults.getInt(DeletionBatchSize)
+      , clusterActorsAskTimeoutMillis = configWithDefaults.getInt(ClusterActorsAskTimeoutMillis)
+      , simpleConsumerSocketTimeoutMillis =  configWithDefaults.getInt(SimpleConsumerSocketTimeoutMillis)
+      , defaultTuning = defaultTuning
+      , consumerProperties = getConsumerPropertiesFromConfig(configWithDefaults)
     )
   }
 
@@ -145,21 +182,41 @@ class KafkaManager(akkaConfig: Config)
     MILLISECONDS
   )
 
+  private[this] def getConsumerPropertiesFromConfig(config: Config) : Option[Properties] = {
+    if(config.hasPath(ConsumerPropertiesFile)) {
+      val filePath = config.getString(ConsumerPropertiesFile)
+      val file = new java.io.File(filePath)
+      if(file.isFile & file.canRead) {
+        val props = new Properties()
+        props.load(new java.io.FileInputStream(file))
+        return Option(props)
+      } else {
+        warn(s"Failed to find consumer properties file or file is not readable : $file")
+      }
+    }
+    None
+  }
+
   private[this] def tryWithKafkaManagerActor[Input, Output, FOutput](msg: Input)
     (fn: Output => FOutput)
     (implicit tag: ClassTag[Output]): Future[ApiError \/ FOutput] =
   {
     implicit val ec = apiExecutionContext
     system.actorSelection(kafkaManagerActor).ask(msg).map {
-      case err: ActorErrorResponse => -\/(ApiError.from(err))
+      case err: ActorErrorResponse => 
+        error(s"Failed on input : $msg")
+        -\/(ApiError.from(err))
       case o: Output =>
         Try {
           fn(o)
         } match {
-          case Failure(t) => -\/(ApiError.fromThrowable(t))
+          case Failure(t) => 
+            error(s"Failed on input : $msg")
+            -\/(ApiError.fromThrowable(t))
           case Success(foutput) => \/-(foutput)
         }
     }.recover { case t: Throwable =>
+      error(s"Failed on input : $msg", t)
       -\/(ApiError.fromThrowable(t))
     }
   }
@@ -190,7 +247,7 @@ class KafkaManager(akkaConfig: Config)
   def shutdown(): Unit = {
     implicit val ec = apiExecutionContext
     system.actorSelection(kafkaManagerActor).tell(KMShutdown, system.deadLetters)
-    system.shutdown()
+    Try(Await.ready(system.terminate(), Duration(30, TimeUnit.SECONDS)))
     apiExecutor.shutdown()
   }
 
@@ -201,8 +258,13 @@ class KafkaManager(akkaConfig: Config)
                  jmxEnabled: Boolean,
                  jmxUser: Option[String],
                  jmxPass: Option[String],
+                 jmxSsl: Boolean,
                  pollConsumers: Boolean,
                  filterConsumers: Boolean,
+                 tuning: Option[ClusterTuning],
+                 securityProtocol: String,
+                 saslMechanism: Option[String],
+                 jaasConfig: Option[String],
                  logkafkaEnabled: Boolean = false,
                  activeOffsetCacheEnabled: Boolean = false,
                  displaySizeEnabled: Boolean = false): Future[ApiError \/ Unit] =
@@ -211,9 +273,14 @@ class KafkaManager(akkaConfig: Config)
       clusterName,
       version,
       zkHosts,
+      tuning = tuning,
+      securityProtocol = securityProtocol,
+      saslMechanism = saslMechanism,
+      jaasConfig = jaasConfig,
       jmxEnabled = jmxEnabled,
       jmxUser = jmxUser,
       jmxPass = jmxPass,
+      jmxSsl = jmxSsl,
       pollConsumers = pollConsumers,
       filterConsumers = filterConsumers,
       logkafkaEnabled = logkafkaEnabled,
@@ -230,8 +297,13 @@ class KafkaManager(akkaConfig: Config)
                     jmxEnabled: Boolean,
                     jmxUser: Option[String],
                     jmxPass: Option[String],
+                    jmxSsl: Boolean,
                     pollConsumers: Boolean,
                     filterConsumers: Boolean,
+                    tuning: Option[ClusterTuning],
+                    securityProtocol: String,
+                    saslMechanism: Option[String],
+                    jaasConfig: Option[String],
                     logkafkaEnabled: Boolean = false,
                     activeOffsetCacheEnabled: Boolean = false,
                     displaySizeEnabled: Boolean = false): Future[ApiError \/ Unit] =
@@ -240,9 +312,14 @@ class KafkaManager(akkaConfig: Config)
       clusterName,
       version,
       zkHosts,
+      tuning = tuning,
+      securityProtocol = securityProtocol,
+      saslMechanism = saslMechanism,
+      jaasConfig = jaasConfig,
       jmxEnabled = jmxEnabled,
       jmxUser = jmxUser,
       jmxPass = jmxPass,
+      jmxSsl = jmxSsl,
       pollConsumers = pollConsumers,
       filterConsumers = filterConsumers,
       logkafkaEnabled = logkafkaEnabled,
@@ -308,13 +385,14 @@ class KafkaManager(akkaConfig: Config)
   def generatePartitionAssignments(
                                     clusterName: String,
                                     topics: Set[String],
-                                    brokers: Set[Int]
+                                    brokers: Set[Int],
+                                    replicationFactor: Option[Int] = None
                                     ): Future[IndexedSeq[ApiError] \/ Unit] =
   {
     val results = tryWithKafkaManagerActor(
       KMClusterCommandRequest(
         clusterName,
-        CMGeneratePartitionAssignments(topics, brokers)
+        CMGeneratePartitionAssignments(topics, brokers, replicationFactor)
       )
     ) { result: CMCommandResults =>
       val errors = result.result.collect { case Failure(t) => ApiError(t.getMessage)}
@@ -330,12 +408,25 @@ class KafkaManager(akkaConfig: Config)
     }
   }
 
-  def runReassignPartitions(clusterName: String, topics: Set[String]): Future[IndexedSeq[ApiError] \/ Unit] = {
+  def runReassignPartitions(clusterName: String, topics: Set[String], force: Boolean = false): Future[IndexedSeq[ApiError] \/ Unit] = {
     implicit val ec = apiExecutionContext
-    val results = tryWithKafkaManagerActor(KMClusterCommandRequest(clusterName, CMRunReassignPartition(topics))) {
+    val forceSet: Set[ForceReassignmentCommand] = {
+      if(force) {
+        Set(ForceOnReplicationOutOfSync)
+      } else Set.empty
+    }
+    val results = tryWithKafkaManagerActor(KMClusterCommandRequest(clusterName, CMRunReassignPartition(topics, forceSet))) {
       resultFuture: Future[CMCommandResults] =>
         resultFuture map { result =>
-          val errors = result.result.collect { case Failure(t) => ApiError(t.getMessage)}
+          val errors = result.result.collect {
+            case Failure(t) =>
+              t match {
+                case UtilException(e) if e.isInstanceOf[ReplicationOutOfSync] =>
+                  ApiError(t.getMessage, recoverByForceOperation = true)
+                case _ =>
+                  ApiError(t.getMessage)
+              }
+          }
           if (errors.isEmpty)
             \/-({})
           else
@@ -526,7 +617,7 @@ class KafkaManager(akkaConfig: Config)
       identity[Map[String, TopicIdentity]])
     val futureTopicList = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, KSGetTopics))(identity[TopicList])
     val futureTopicToConsumerMap = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, BVGetTopicConsumerMap))(
-      identity[Map[String, Iterable[String]]])
+      identity[Map[String, Iterable[(String, ConsumerType)]]])
     val futureTopicsReasgn = getTopicsUnderReassignment(clusterName)
     implicit val ec = apiExecutionContext
     for {
@@ -548,7 +639,7 @@ class KafkaManager(akkaConfig: Config)
 
   def getConsumerListExtended(clusterName: String): Future[ApiError \/ ConsumerListExtended] = {
     val futureConsumerIdentities = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, BVGetConsumerIdentities))(
-      identity[Map[String, ConsumerIdentity]])
+      identity[Map[(String, ConsumerType), ConsumerIdentity]])
     val futureConsumerList = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, KSGetConsumers))(identity[ConsumerList])
     implicit val ec = apiExecutionContext
     for {
@@ -559,7 +650,7 @@ class KafkaManager(akkaConfig: Config)
         ci <- errorOrCI
         cl <- errorOrCL
       } yield {
-        ConsumerListExtended(cl.list.map(c => (c, ci.get(c))), cl.clusterContext)
+        ConsumerListExtended(cl.list.map(c => ((c.name, c.consumerType), ci.get((c.name, c.consumerType)))), cl.clusterContext)
       }
     }
   }
@@ -663,12 +754,12 @@ class KafkaManager(akkaConfig: Config)
     }
   }
 
-  def getConsumersForTopic(clusterName: String, topic: String): Future[Option[Iterable[String]]] = {
+  def getConsumersForTopic(clusterName: String, topic: String): Future[Option[Iterable[(String, ConsumerType)]]] = {
     val futureTopicConsumerMap = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, BVGetTopicConsumerMap))(
-      identity[Map[String, Iterable[String]]])
+      identity[Map[String, Iterable[(String, ConsumerType)]]])
     implicit val ec = apiExecutionContext
-    futureTopicConsumerMap.map[Option[Iterable[String]]] { errOrTCM =>
-      errOrTCM.fold[Option[Iterable[String]]] (_ => None, _.get(topic))
+    futureTopicConsumerMap.map[Option[Iterable[(String, ConsumerType)]]] { errOrTCM =>
+      errOrTCM.fold[Option[Iterable[(String, ConsumerType)]]] (_ => None, _.get(topic))
     }
   }
 
@@ -678,11 +769,23 @@ class KafkaManager(akkaConfig: Config)
     )
   }
 
-  def getConsumerIdentity(clusterName: String, consumer: String): Future[ApiError \/ ConsumerIdentity] = {
-    val futureCMConsumerIdentity = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, CMGetConsumerIdentity(consumer)))(
-      identity[CMConsumerIdentity]
-    )
+  private[this] def tryWithConsumerType[T](consumerType: String)(fn: ConsumerType => Future[ApiError \/ T])(implicit ec: ExecutionContext) : Future[ApiError \/ T] = {
+    Future.successful[ApiError \/ ConsumerType] {
+      ConsumerType.from(consumerType).fold[ApiError \/ ConsumerType](-\/(ApiError(s"Unknown consumer type : $consumerType"))){
+        ct => \/-(ct)
+      }
+    }.flatMap { ctOrError =>
+      ctOrError.fold(err => Future.successful[ApiError \/ T](-\/(err)), fn)
+    }
+  }
+
+  def getConsumerIdentity(clusterName: String, consumer: String, consumerType: String): Future[ApiError \/ ConsumerIdentity] = {
     implicit val ec = apiExecutionContext
+    val futureCMConsumerIdentity = tryWithConsumerType(consumerType) { ct =>
+        tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, CMGetConsumerIdentity(consumer, ct)))(
+          identity[CMConsumerIdentity]
+        )
+    }
     futureCMConsumerIdentity.map[ApiError \/ ConsumerIdentity] { errOrCI =>
       errOrCI.fold[ApiError \/ ConsumerIdentity](
       { err: ApiError =>
@@ -698,11 +801,13 @@ class KafkaManager(akkaConfig: Config)
     }
   }
 
-  def getConsumedTopicState(clusterName: String, consumer: String, topic: String): Future[ApiError \/ ConsumedTopicState] = {
-    val futureCMConsumedTopic = tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, CMGetConsumedTopicState(consumer,topic)))(
-      identity[CMConsumedTopic]
-    )
+  def getConsumedTopicState(clusterName: String, consumer: String, topic: String, consumerType: String): Future[ApiError \/ ConsumedTopicState] = {
     implicit val ec = apiExecutionContext
+    val futureCMConsumedTopic = tryWithConsumerType(consumerType) { ct =>
+      tryWithKafkaManagerActor(KMClusterQueryRequest(clusterName, CMGetConsumedTopicState(consumer, topic, ct)))(
+        identity[CMConsumedTopic]
+      )
+    }
     futureCMConsumedTopic.map[ApiError \/ ConsumedTopicState] { errOrCT =>
       errOrCT.fold[ApiError \/ ConsumedTopicState](
       { err: ApiError =>

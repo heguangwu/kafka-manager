@@ -7,6 +7,7 @@ package kafka.manager.utils
 import java.util.Properties
 
 import TopicErrors._
+import kafka.manager.BaseTest
 import kafka.manager.model.ActorModel
 import ActorModel.{PartitionOffsetsCapture, TopicIdentity, TopicDescription}
 import kafka.manager.features.ClusterFeatures
@@ -16,10 +17,10 @@ import scala.concurrent.Future
 /**
  * @author hiral
  */
-class TestCreateTopic extends CuratorAwareTest {
+class TestCreateTopic extends CuratorAwareTest with BaseTest {
   
   private[this] val adminUtils  = new AdminUtils(Kafka_0_8_2_0)
-  private[this] val defaultClusterConfig = ClusterConfig("test","0.8.2.0","localhost:2818",100,false, pollConsumers = true, filterConsumers = true, jmxUser = None, jmxPass = None)
+  private[this] val defaultClusterConfig = ClusterConfig("test","0.8.2.0","localhost:2818",100,false, pollConsumers = true, filterConsumers = true, jmxUser = None, jmxPass = None, jmxSsl = false, tuning = Option(defaultTuning), securityProtocol = "PLAINTEXT", saslMechanism = None, jaasConfig = None)
   private[this] val defaultClusterContext = ClusterContext(ClusterFeatures.from(defaultClusterConfig), defaultClusterConfig)
 
   test("create topic with empty name") {
@@ -97,7 +98,7 @@ class TestCreateTopic extends CuratorAwareTest {
       val stat = new Stat()
       val json:String = curator.getData.storingStatIn(stat).forPath(ZkUtils.getTopicPath("mytopic"))
       val configJson : String = curator.getData.forPath(ZkUtils.getTopicConfigPath("mytopic"))
-      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion(),json),None,Future.successful(PartitionOffsetsCapture.EMPTY),Option((-1,configJson))),None,None,defaultClusterContext,None)
+      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion(),json),None,PartitionOffsetsCapture.EMPTY,Option((-1,configJson))),None,None,defaultClusterContext,None)
       assert(td.partitions == 10)
       assert(td.replicationFactor == 3)
     }
@@ -121,7 +122,7 @@ class TestCreateTopic extends CuratorAwareTest {
         val stat = new Stat
         val json:String = curator.getData.storingStatIn(stat).forPath(ZkUtils.getTopicPath("mytopic"))
         val configJson : String = curator.getData.forPath(ZkUtils.getTopicConfigPath("mytopic"))
-        val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,Future.successful(PartitionOffsetsCapture.EMPTY),Option((-1,configJson))),None,None,defaultClusterContext,None)
+        val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,PartitionOffsetsCapture.EMPTY,Option((-1,configJson))),None,None,defaultClusterContext,None)
         val numPartitions = td.partitions
         adminUtils.addPartitions(curator, td.topic, numPartitions, td.partitionsIdentity.mapValues(_.replicas.toSeq),brokerList, stat.getVersion)
       }
@@ -135,7 +136,7 @@ class TestCreateTopic extends CuratorAwareTest {
         val stat = new Stat
         val json:String = curator.getData.storingStatIn(stat).forPath(ZkUtils.getTopicPath("mytopic"))
         val configJson : String = curator.getData.forPath(ZkUtils.getTopicConfigPath("mytopic"))
-        val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,Future.successful(PartitionOffsetsCapture.EMPTY),Option((-1,configJson))),None,None,defaultClusterContext,None)
+        val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,PartitionOffsetsCapture.EMPTY,Option((-1,configJson))),None,None,defaultClusterContext,None)
         val numPartitions = td.partitions + 2
         adminUtils.addPartitions(curator, td.topic, numPartitions, td.partitionsIdentity.mapValues(_.replicas.toSeq),brokerList,stat.getVersion)
       }
@@ -148,7 +149,7 @@ class TestCreateTopic extends CuratorAwareTest {
       val stat = new Stat
       val json:String = curator.getData.storingStatIn(stat).forPath(ZkUtils.getTopicPath("mytopic"))
       val configJson : String = curator.getData.forPath(ZkUtils.getTopicConfigPath("mytopic"))
-      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,Future.successful(PartitionOffsetsCapture.EMPTY),Option((-1,configJson))),None,None,defaultClusterContext,None)
+      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,PartitionOffsetsCapture.EMPTY,Option((-1,configJson))),None,None,defaultClusterContext,None)
       val numPartitions = td.partitions + 2
       adminUtils.addPartitions(curator, td.topic, numPartitions, td.partitionsIdentity.mapValues(_.replicas.toSeq),brokerList,stat.getVersion)
 
@@ -156,7 +157,7 @@ class TestCreateTopic extends CuratorAwareTest {
       {
         val json: String = curator.getData.forPath(ZkUtils.getTopicPath("mytopic"))
         val configJson: String = curator.getData.forPath(ZkUtils.getTopicConfigPath("mytopic"))
-        val td = TopicIdentity.from(3, TopicDescription("mytopic", (-1,json), None, Future.successful(PartitionOffsetsCapture.EMPTY), Option((-1,configJson))),None,None,defaultClusterContext,None)
+        val td = TopicIdentity.from(3, TopicDescription("mytopic", (-1,json), None, PartitionOffsetsCapture.EMPTY, Option((-1,configJson))),None,None,defaultClusterContext,None)
         assert(td.partitions === numPartitions, "Failed to add partitions!")
         assert(td.config.toMap.apply(kafka.manager.utils.zero82.LogConfig.RententionMsProp) === "1800000")
       }
@@ -171,7 +172,7 @@ class TestCreateTopic extends CuratorAwareTest {
       val configStat = new Stat
       val configJson : String = curator.getData.storingStatIn(configStat).forPath(ZkUtils.getTopicConfigPath("mytopic"))
       val configReadVersion = configStat.getVersion
-      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,Future.successful(PartitionOffsetsCapture.EMPTY),Option((configReadVersion,configJson))),None,None,defaultClusterContext,None)
+      val td = TopicIdentity.from(3,TopicDescription("mytopic",(stat.getVersion,json),None,PartitionOffsetsCapture.EMPTY,Option((configReadVersion,configJson))),None,None,defaultClusterContext,None)
       val properties = new Properties()
       td.config.foreach { case (k,v) => properties.put(k,v)}
       properties.setProperty(kafka.manager.utils.zero82.LogConfig.RententionMsProp,"3600000")
@@ -182,7 +183,7 @@ class TestCreateTopic extends CuratorAwareTest {
         val json: String = curator.getData.forPath(ZkUtils.getTopicPath("mytopic"))
         val configStat = new Stat
         val configJson : String = curator.getData.storingStatIn(configStat).forPath(ZkUtils.getTopicConfigPath("mytopic"))
-        val td = TopicIdentity.from(3, TopicDescription("mytopic", (-1,json), None, Future.successful(PartitionOffsetsCapture.EMPTY), Option((configStat.getVersion,configJson))),None,None,defaultClusterContext,None)
+        val td = TopicIdentity.from(3, TopicDescription("mytopic", (-1,json), None, PartitionOffsetsCapture.EMPTY, Option((configStat.getVersion,configJson))),None,None,defaultClusterContext,None)
         assert(td.config.toMap.apply(kafka.manager.utils.zero82.LogConfig.RententionMsProp) === "3600000")
         assert(configReadVersion != configStat.getVersion)
       }
@@ -198,7 +199,7 @@ class TestCreateTopic extends CuratorAwareTest {
         }
 
         assert(json.isDefined, "Failed to get data for config change!")
-        assert(json.get === "\"mytopic\"")
+        assert(json.get contains "\"mytopic\"")
       }
 
     }

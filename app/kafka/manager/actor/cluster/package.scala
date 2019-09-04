@@ -5,12 +5,35 @@
 
 package kafka.manager.actor
 
-import kafka.manager.features.{ClusterFeatures, ClusterFeature}
+import grizzled.slf4j.Logging
+import kafka.manager.features.{ClusterFeature, ClusterFeatures}
+import org.apache.kafka.common.KafkaFuture.BiConsumer
+
+import scala.util.{Failure, Try}
 
 /**
  * Created by hiral on 12/1/15.
  */
 package object cluster {
+  implicit class TryLogErrorHelper[T](t: Try[T]) extends Logging {
+    def logError(s: => String) : Try[T] = {
+      t match {
+        case Failure(e) =>
+          error(s, e)
+        case _ => //do nothing
+      }
+      t
+    }
+  }
+
+  implicit def toBiConsumer[A,B](fn: (A, B) => Unit): BiConsumer[A, B] = {
+    new BiConsumer[A, B] {
+      override def accept(a: A, b: B): Unit = {
+        fn(a, b)
+      }
+    }
+  }
+
   def featureGate[T](af: ClusterFeature)(fn: => Unit)(implicit features: ClusterFeatures) : Unit = {
     if(features.features(af)) {
       fn

@@ -6,13 +6,15 @@ package kafka.manager
 
 import java.nio.charset.StandardCharsets
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 
 import akka.actor.{ActorRef, ActorSystem, Props}
 import akka.pattern._
 import akka.util.Timeout
 import com.typesafe.config.{Config, ConfigFactory}
-import kafka.manager.actor.cluster.{ClusterManagerActorConfig, ClusterManagerActor}
-import kafka.manager.model.{ClusterConfig, CuratorConfig, ActorModel}
+import kafka.manager.actor.cluster.{ClusterManagerActor, ClusterManagerActorConfig}
+import kafka.manager.base.LongRunningPoolConfig
+import kafka.manager.model.{ActorModel, ClusterConfig, CuratorConfig}
 import kafka.manager.utils.zero81.PreferredLeaderElectionErrors
 import kafka.test.SeededBroker
 import kafka.manager.utils.{CuratorAwareTest, ZkUtils}
@@ -26,7 +28,7 @@ import scala.util.Try
 /**
  * @author hiral
  */
-class TestClusterManagerActor extends CuratorAwareTest {
+class TestClusterManagerActor extends CuratorAwareTest with BaseTest {
 
   private[this] val akkaConfig: Properties = new Properties()
   akkaConfig.setProperty("pinned-dispatcher.type","PinnedDispatcher")
@@ -45,9 +47,14 @@ class TestClusterManagerActor extends CuratorAwareTest {
 
   override protected def beforeAll(): Unit = {
     super.beforeAll()
-    val clusterConfig = ClusterConfig("dev","0.8.2.0",kafkaServerZkPath, jmxEnabled = false, pollConsumers = true, filterConsumers = true, logkafkaEnabled = true, jmxUser = None, jmxPass = None)
+    val clusterConfig = ClusterConfig("dev","0.8.2.0",kafkaServerZkPath, jmxEnabled = false, pollConsumers = true, filterConsumers = true, logkafkaEnabled = true, jmxUser = None, jmxPass = None, jmxSsl = false, tuning = Option(defaultTuning), securityProtocol="PLAINTEXT", saslMechanism=None, jaasConfig=None)
     val curatorConfig = CuratorConfig(testServer.getConnectString)
-    val config = ClusterManagerActorConfig("pinned-dispatcher","/kafka-manager/clusters/dev",curatorConfig,clusterConfig,FiniteDuration(1,SECONDS))
+    val config = ClusterManagerActorConfig(
+      "pinned-dispatcher"
+      ,"/kafka-manager/clusters/dev"
+      ,curatorConfig,clusterConfig
+      ,None
+    )
     val props = Props(classOf[ClusterManagerActor],config)
 
     clusterManagerActor = Some(system.actorOf(props,"dev"))
@@ -56,7 +63,7 @@ class TestClusterManagerActor extends CuratorAwareTest {
   override protected def afterAll(): Unit = {
     Thread.sleep(1000)
     Try(clusterManagerActor.foreach( _ ! CMShutdown))
-    Try(system.shutdown())
+    Try(Await.ready(system.terminate(), Duration(5, TimeUnit.SECONDS)))
     Try(broker.shutdown())
     super.afterAll()
   }
@@ -241,7 +248,7 @@ class TestClusterManagerActor extends CuratorAwareTest {
   test("run reassign partition for topic") {
     withClusterManagerActor(KSGetTopics) { result : TopicList =>
       val topicSet = result.list.toSet
-      withClusterManagerActor(CMRunReassignPartition(topicSet)) { cmResultsFuture: Future[CMCommandResults] =>
+      withClusterManagerActor(CMRunReassignPartition(topicSet, Set.empty)) { cmResultsFuture: Future[CMCommandResults] =>
         val cmResult = Await.result(cmResultsFuture,10 seconds)
         Thread.sleep(1000)
         cmResult.result.foreach { t =>
